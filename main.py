@@ -76,12 +76,18 @@ class ConfigRollbackValidator:
           config_path (str): The path to the configuration file.
 
       Returns:
-          bool: True if the syntax is valid, False otherwise.
+          bool or None: True if the syntax is valid, False if the linter
+          reported a syntax failure, and None if the linter binary itself
+          is missing, in which case the lint step is skipped and the
+          comparison still runs. A missing linter is never reported as a
+          syntax failure of the configuration.
       """
       try:
           if self.config_type.lower() == 'yaml':
+              linter = 'yamllint'
               result = subprocess.run(['yamllint', config_path], capture_output=True, text=True)
           elif self.config_type.lower() == 'json':
+              linter = 'jsonlint'
               result = subprocess.run(['jsonlint', '-q', config_path], capture_output=True, text=True)  # -q for quiet mode
           else:
               self.logger.error(f"Unsupported configuration type: {self.config_type}")
@@ -95,8 +101,8 @@ class ConfigRollbackValidator:
               return False
 
       except FileNotFoundError as e:
-          self.logger.error(f"Required tool not found: {e}")
-          return False
+          self.logger.warning(f"Missing linter '{linter}': skipping the lint step for {config_path}. The configuration syntax was not checked by {linter}; this is not a syntax failure of the configuration.")
+          return None
       except Exception as e:
           self.logger.exception(f"An error occurred during syntax validation: {e}")
           return False
@@ -116,8 +122,10 @@ class ConfigRollbackValidator:
         """
         alerts = []
 
-        # Validate the new config syntax
-        if not self._validate_config_syntax(self.new_config_path):
+        # Validate the new config syntax. A missing linter (None) skips
+        # the lint step and the comparison still runs; only an actual
+        # lint failure (False) aborts the comparison.
+        if self._validate_config_syntax(self.new_config_path) is False:
             self.logger.error(f"Syntax validation failed for new configuration: {self.new_config_path}. Aborting comparison.")
             return ["Syntax validation failed for the new configuration. Please correct the syntax errors."]
         try:
@@ -136,7 +144,7 @@ class ConfigRollbackValidator:
 
         for history_file in history_files:
             history_path = os.path.join(self.config_history_dir, history_file)
-            if not self._validate_config_syntax(history_path):
+            if self._validate_config_syntax(history_path) is False:
                 self.logger.warning(f"Skipping invalid history file: {history_file}")
                 continue
 
@@ -153,9 +161,12 @@ class ConfigRollbackValidator:
             )
             delta = '\n'.join(diff)
 
-            # Calculate similarity score.  Simple approach: count added/removed lines.
-            added_lines = delta.count('+')
-            removed_lines = delta.count('-')
+            # Calculate similarity score. Count only diff lines that
+            # start with the ndiff plus or minus marker, so plus and
+            # hyphen characters inside values are never counted.
+            diff_lines = delta.splitlines()
+            added_lines = sum(1 for line in diff_lines if line.startswith('+ '))
+            removed_lines = sum(1 for line in diff_lines if line.startswith('- '))
             total_lines = len(json.dumps(new_config, indent=2).splitlines()) + len(json.dumps(historical_config, indent=2).splitlines())
             change_ratio = (added_lines + removed_lines) / total_lines if total_lines > 0 else 0
 
@@ -170,13 +181,24 @@ class ConfigRollbackValidator:
             return []
 
 
+def _sensitivity(value):
+    """Argparse type for --sensitivity: a float in the 0 to 1 range."""
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"sensitivity must be a number between 0 and 1, got {value!r}")
+    if not 0.0 <= number <= 1.0:
+        raise argparse.ArgumentTypeError(f"sensitivity must be between 0 and 1, got {number}")
+    return number
+
+
 def setup_argparse():
     """Sets up the argument parser."""
     parser = argparse.ArgumentParser(description="Compares a proposed configuration change against a history of past configuration states.")
     parser.add_argument("config_history_dir", help="Path to the directory containing historical configuration files.")
     parser.add_argument("new_config_path", help="Path to the new configuration file.")
     parser.add_argument("--config_type", help="Type of configuration file (yaml or json). Defaults to yaml.", default="yaml")
-    parser.add_argument("--sensitivity", type=float, default=0.8, help="Similarity threshold (0-1). Higher values require higher similarity. Default: 0.8")
+    parser.add_argument("--sensitivity", type=_sensitivity, default=0.8, help="Similarity threshold (0-1). Higher values require higher similarity. Default: 0.8")
     return parser
 
 def main():
@@ -197,9 +219,15 @@ def main():
         alerts = validator.compare_with_history(args.sensitivity)
 
         if alerts:
+            not_performed = [a for a in alerts if a.startswith("No historical configurations found.")]
+            if not_performed and len(not_performed) == len(alerts):
+                for alert in alerts:
+                    print(f"Comparison not performed: {alert}")
+                sys.exit(1)
             print("Potential regressions or unexpected changes detected:")
             for alert in alerts:
                 print(alert)
+            sys.exit(1)
         else:
             print("No significant deviations detected.")
 

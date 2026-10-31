@@ -1,2 +1,4 @@
 jsonschema>=4.17.0
 pyyaml>=6.0
+yamllint>=1.26
+jsonlint>=0.9.0
