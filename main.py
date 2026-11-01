@@ -134,6 +134,11 @@ class ConfigRollbackValidator:
             self.logger.error(f"Failed to load new configuration: {e}")
             return ["Failed to load new configuration. Please check the configuration file."]
 
+        # Every regular file in the directory is history, whatever its
+        # name or suffix, and all of them are parsed as the one config
+        # type the operator declared. Sorting is by file name, and
+        # nothing treats any entry as more recent than another: the
+        # new config is compared against each one in turn.
         history_files = sorted([f for f in os.listdir(self.config_history_dir)
                                 if os.path.isfile(os.path.join(self.config_history_dir, f))])
 
@@ -144,6 +149,11 @@ class ConfigRollbackValidator:
 
         for history_file in history_files:
             history_path = os.path.join(self.config_history_dir, history_file)
+            # Every history file is linted on every run, one subprocess
+            # each, before it is even loaded. In a large history directory
+            # that cost is paid in full on every comparison, and a file
+            # that fails lint is skipped silently apart from the warning,
+            # so it contributes no comparison and no alert.
             if self._validate_config_syntax(history_path) is False:
                 self.logger.warning(f"Skipping invalid history file: {history_file}")
                 continue
@@ -155,6 +165,13 @@ class ConfigRollbackValidator:
                 continue
 
 
+            # The comparison runs on JSON dumps of the parsed data, in the
+            # key order the documents were written in, because json.dumps
+            # is not asked to sort. Reordering keys in the new file is
+            # therefore a visible change to me even when the settings are
+            # identical. A YAML value that JSON cannot represent, a date
+            # for instance, raises at this dump, outside the load guard
+            # above, and ends the whole comparison in main.
             diff = difflib.ndiff(
                 json.dumps(historical_config, indent=2).splitlines(),
                 json.dumps(new_config, indent=2).splitlines()
@@ -170,7 +187,17 @@ class ConfigRollbackValidator:
             total_lines = len(json.dumps(new_config, indent=2).splitlines()) + len(json.dumps(historical_config, indent=2).splitlines())
             change_ratio = (added_lines + removed_lines) / total_lines if total_lines > 0 else 0
 
+            # Sensitivity enters inverted: at the default 0.8, a change
+            # ratio above 0.2 alerts. The ratio itself counts one changed
+            # value as two lines, one removed and one added, against the
+            # combined length of both documents, so small files cross the
+            # line on a single setting change.
             if change_ratio > (1 - sensitivity):  # If the change is significant
+                # Each history file gets its own verdict, and the alert carries
+                # the full diff text. A new config identical to the oldest
+                # snapshot still alerts against the newest one, because I
+                # never ask which state a rollback would return to; I only
+                # measure distance from every state I was given.
                 alerts.append(f"Significant deviation detected compared to {history_file}:\n{delta}")
                 self.logger.warning(f"Significant deviation detected compared to {history_file}")
             else:
